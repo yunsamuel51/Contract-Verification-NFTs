@@ -8,12 +8,17 @@
 (define-constant err-insufficient-payment (err u106))
 (define-constant err-transfer-failed (err u107))
 (define-constant err-mint-failed (err u108))
+(define-constant err-insufficient-stake (err u109))
+(define-constant err-no-stake-found (err u110))
+(define-constant err-stake-locked (err u111))
 
 (define-non-fungible-token verification-certificate uint)
 
 (define-data-var last-token-id uint u0)
 (define-data-var verification-fee uint u1000000)
 (define-data-var min-verification-duration uint u144)
+(define-data-var staking-yield-rate uint u5)
+(define-data-var min-stake-amount uint u10000000)
 
 (define-map token-metadata
     uint
@@ -51,6 +56,50 @@
         min-duration: uint,
         base-fee: uint,
         required-reputation: uint,
+    }
+)
+
+(define-data-var history-entry-id uint u0)
+
+(define-map verification-history
+    uint
+    {
+        contract-address: principal,
+        token-id: uint,
+        event-type: (string-ascii 20),
+        verification-level: (string-ascii 20),
+        verified-by: principal,
+        block-height: uint,
+        expiry-block: uint,
+        previous-entry: (optional uint),
+    }
+)
+
+(define-map contract-history-index
+    principal
+    {
+        latest-entry: (optional uint),
+        total-entries: uint,
+    }
+)
+
+(define-map verification-stakes
+    uint
+    {
+        staker: principal,
+        amount: uint,
+        start-block: uint,
+        lock-duration: uint,
+        yield-claimed: uint,
+    }
+)
+
+(define-map staker-positions
+    principal
+    {
+        active-stakes: (list 10 uint),
+        total-staked: uint,
+        total-rewards: uint,
     }
 )
 
@@ -113,6 +162,46 @@
     (ok (var-get verification-fee))
 )
 
+(define-read-only (get-stake-info (token-id uint))
+    (match (map-get? verification-stakes token-id)
+        stake (ok stake)
+        (err err-no-stake-found)
+    )
+)
+
+(define-read-only (get-staker-position (staker principal))
+    (match (map-get? staker-positions staker)
+        position (ok position)
+        (ok {
+            active-stakes: (list),
+            total-staked: u0,
+            total-rewards: u0,
+        })
+    )
+)
+
+(define-read-only (calculate-staking-rewards (token-id uint))
+    (match (map-get? verification-stakes token-id)
+        stake (let (
+                (blocks-staked (- stacks-block-height (get start-block stake)))
+                (annual-rate (var-get staking-yield-rate))
+                (rewards-per-block (/ (* (get amount stake) annual-rate) (* u100 u52560)))
+                (total-rewards (* rewards-per-block blocks-staked))
+                (unclaimed-rewards (- total-rewards (get yield-claimed stake)))
+            )
+            (ok unclaimed-rewards)
+        )
+        (err err-no-stake-found)
+    )
+)
+
+(define-read-only (get-staking-params)
+    (ok {
+        yield-rate: (var-get staking-yield-rate),
+        min-stake: (var-get min-stake-amount),
+    })
+)
+
 (define-read-only (get-verification-status (contract-address principal))
     (match (map-get? contract-verifications contract-address)
         verification (match (map-get? token-metadata (get token-id verification))
@@ -136,6 +225,23 @@
             verification-date: u0,
             expiry-block: u0,
             verification-count: u0,
+        })
+    )
+)
+
+(define-read-only (get-verification-history-entry (entry-id uint))
+    (match (map-get? verification-history entry-id)
+        entry (ok entry)
+        (err err-not-found)
+    )
+)
+
+(define-read-only (get-contract-history-summary (contract-address principal))
+    (match (map-get? contract-history-index contract-address)
+        index (ok index)
+        (ok {
+            latest-entry: none,
+            total-entries: u0,
         })
     )
 )
@@ -351,6 +457,23 @@
     )
 )
 
+(define-public (update-staking-yield-rate (new-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (<= new-rate u20) err-owner-only)
+        (var-set staking-yield-rate new-rate)
+        (ok true)
+    )
+)
+
+(define-public (update-min-stake-amount (new-amount uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set min-stake-amount new-amount)
+        (ok true)
+    )
+)
+
 (define-public (burn (token-id uint))
     (let ((token-owner (unwrap! (nft-get-owner? verification-certificate token-id) err-not-found)))
         (asserts! (is-eq tx-sender token-owner) err-not-token-owner)
@@ -358,12 +481,157 @@
     )
 )
 
-(define-public (batch-verify-contracts (contracts (list 10
+(define-public (stake-for-verification
+        (token-id uint)
+        (stake-amount uint)
+        (lock-blocks uint)
+    )
+    (let (
+            (token-owner (unwrap! (nft-get-owner? verification-certificate token-id)
+                err-not-found
+            ))
+            (current-position (default-to {
+                active-stakes: (list),
+                total-staked: u0,
+                total-rewards: u0,
+            }
+                (map-get? staker-positions tx-sender)
+            ))
+        )
+        (asserts! (is-eq tx-sender token-owner) err-not-token-owner)
+        (asserts! (>= stake-amount (var-get min-stake-amount))
+            err-insufficient-stake
+        )
+        (asserts! (>= lock-blocks u1008) err-verification-expired)
+
+        (unwrap! (stx-transfer? stake-amount tx-sender (as-contract tx-sender))
+            err-transfer-failed
+        )
+
+        (map-set verification-stakes token-id {
+            staker: tx-sender,
+            amount: stake-amount,
+            start-block: stacks-block-height,
+            lock-duration: lock-blocks,
+            yield-claimed: u0,
+        })
+
+        (let ((updated-stakes (unwrap!
+                (as-max-len?
+                    (append (get active-stakes current-position) token-id)
+                    u10
+                )
+                err-insufficient-stake
+            )))
+            (map-set staker-positions tx-sender {
+                active-stakes: updated-stakes,
+                total-staked: (+ (get total-staked current-position) stake-amount),
+                total-rewards: (get total-rewards current-position),
+            })
+        )
+
+        (ok token-id)
+    )
+)
+
+(define-public (claim-staking-rewards (token-id uint))
+    (let (
+            (stake-info (unwrap! (map-get? verification-stakes token-id) err-no-stake-found))
+            (token-owner (unwrap! (nft-get-owner? verification-certificate token-id)
+                err-not-found
+            ))
+            (rewards (unwrap! (calculate-staking-rewards token-id) err-no-stake-found))
+            (current-position (unwrap! (map-get? staker-positions tx-sender) err-no-stake-found))
+        )
+        (asserts! (is-eq tx-sender token-owner) err-not-token-owner)
+        (asserts! (is-eq tx-sender (get staker stake-info)) err-not-token-owner)
+        (asserts! (> rewards u0) err-insufficient-stake)
+
+        (unwrap! (as-contract (stx-transfer? rewards tx-sender tx-sender))
+            err-transfer-failed
+        )
+
+        (map-set verification-stakes token-id
+            (merge stake-info { yield-claimed: (+ (get yield-claimed stake-info) rewards) })
+        )
+
+        (map-set staker-positions tx-sender
+            (merge current-position { total-rewards: (+ (get total-rewards current-position) rewards) })
+        )
+
+        (ok rewards)
+    )
+)
+
+(define-public (unstake-verification (token-id uint))
+    (let (
+            (stake-info (unwrap! (map-get? verification-stakes token-id) err-no-stake-found))
+            (token-owner (unwrap! (nft-get-owner? verification-certificate token-id)
+                err-not-found
+            ))
+            (unlock-block (+ (get start-block stake-info) (get lock-duration stake-info)))
+            (current-position (unwrap! (map-get? staker-positions tx-sender) err-no-stake-found))
+            (rewards (unwrap! (calculate-staking-rewards token-id) err-no-stake-found))
+            (total-return (+ (get amount stake-info) rewards))
+        )
+        (asserts! (is-eq tx-sender token-owner) err-not-token-owner)
+        (asserts! (is-eq tx-sender (get staker stake-info)) err-not-token-owner)
+        (asserts! (>= stacks-block-height unlock-block) err-stake-locked)
+
+        (unwrap! (as-contract (stx-transfer? total-return tx-sender tx-sender))
+            err-transfer-failed
+        )
+
+        (let (
+                (filter-result (filter-stakes (get active-stakes current-position) token-id))
+                (updated-stakes (get result filter-result))
+            )
+            (map-set staker-positions tx-sender {
+                active-stakes: updated-stakes,
+                total-staked: (- (get total-staked current-position) (get amount stake-info)),
+                total-rewards: (+ (get total-rewards current-position) rewards),
+            })
+        )
+
+        (map-delete verification-stakes token-id)
+        (ok total-return)
+    )
+)
+
+(define-private (filter-stakes
+        (stakes (list 10 uint))
+        (remove-id uint)
+    )
+    (fold build-filtered-list stakes {
+        target-id: remove-id,
+        result: (list),
+    })
+)
+
+(define-private (build-filtered-list
+        (stake-id uint)
+        (state {
+            target-id: uint,
+            result: (list 10 uint),
+        })
+    )
+    (if (is-eq stake-id (get target-id state))
+        state
+        {
+            target-id: (get target-id state),
+            result: (unwrap-panic (as-max-len? (append (get result state) stake-id) u10)),
+        }
+    )
+)
+
+(define-public (batch-verify-contracts (contracts (list
+    10
     {
-    address: principal,
-    level: (string-ascii 20),
-    duration: uint,
-})))
+        address: principal,
+        level: (string-ascii 20),
+        duration: uint,
+    }
+)))
     (let ((verifier-info (unwrap! (map-get? verifier-registry tx-sender) err-owner-only)))
         (asserts! (get is-authorized verifier-info) err-owner-only)
         (ok (map verify-single-contract contracts))
