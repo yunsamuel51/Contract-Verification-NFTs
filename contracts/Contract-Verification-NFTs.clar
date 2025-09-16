@@ -11,6 +11,12 @@
 (define-constant err-insufficient-stake (err u109))
 (define-constant err-no-stake-found (err u110))
 (define-constant err-stake-locked (err u111))
+(define-constant err-dispute-not-found (err u112))
+(define-constant err-dispute-already-exists (err u113))
+(define-constant err-dispute-period-ended (err u114))
+(define-constant err-insufficient-challenge-stake (err u115))
+(define-constant err-already-voted (err u116))
+(define-constant err-invalid-dispute-status (err u117))
 
 (define-non-fungible-token verification-certificate uint)
 
@@ -19,6 +25,9 @@
 (define-data-var min-verification-duration uint u144)
 (define-data-var staking-yield-rate uint u5)
 (define-data-var min-stake-amount uint u10000000)
+(define-data-var dispute-period uint u1008)
+(define-data-var min-challenge-stake uint u5000000)
+(define-data-var dispute-id-counter uint u0)
 
 (define-map token-metadata
     uint
@@ -103,6 +112,42 @@
     }
 )
 
+(define-map verification-disputes
+    uint
+    {
+        token-id: uint,
+        challenger: principal,
+        challenge-reason: (string-utf8 256),
+        challenge-stake: uint,
+        challenge-block: uint,
+        votes-for: uint,
+        votes-against: uint,
+        total-voters: uint,
+        status: (string-ascii 20),
+        resolution-block: (optional uint),
+    }
+)
+
+(define-map dispute-votes
+    {
+        dispute-id: uint,
+        voter: principal,
+    }
+    {
+        vote: bool,
+        voting-power: uint,
+        vote-block: uint,
+    }
+)
+
+(define-map token-disputes
+    uint
+    {
+        active-dispute-id: (optional uint),
+        dispute-count: uint,
+    }
+)
+
 (define-read-only (get-last-token-id)
     (ok (var-get last-token-id))
 )
@@ -111,6 +156,176 @@
     (match (map-get? token-metadata token-id)
         metadata (ok (get metadata-uri metadata))
         (err err-not-found)
+    )
+)
+
+(define-public (challenge-verification
+        (token-id uint)
+        (challenge-reason (string-utf8 256))
+        (challenge-stake uint)
+    )
+    (let (
+            (token-meta (unwrap! (map-get? token-metadata token-id) err-not-found))
+            (current-disputes (default-to {
+                active-dispute-id: none,
+                dispute-count: u0,
+            }
+                (map-get? token-disputes token-id)
+            ))
+            (dispute-id (+ (var-get dispute-id-counter) u1))
+        )
+        (asserts! (>= challenge-stake (var-get min-challenge-stake))
+            err-insufficient-challenge-stake
+        )
+        (asserts! (is-none (get active-dispute-id current-disputes))
+            err-dispute-already-exists
+        )
+        (asserts! (> (get expiry-block token-meta) stacks-block-height)
+            err-verification-expired
+        )
+
+        (unwrap!
+            (stx-transfer? challenge-stake tx-sender (as-contract tx-sender))
+            err-transfer-failed
+        )
+
+        (map-set verification-disputes dispute-id {
+            token-id: token-id,
+            challenger: tx-sender,
+            challenge-reason: challenge-reason,
+            challenge-stake: challenge-stake,
+            challenge-block: stacks-block-height,
+            votes-for: u0,
+            votes-against: u0,
+            total-voters: u0,
+            status: "active",
+            resolution-block: none,
+        })
+
+        (map-set token-disputes token-id {
+            active-dispute-id: (some dispute-id),
+            dispute-count: (+ (get dispute-count current-disputes) u1),
+        })
+
+        (var-set dispute-id-counter dispute-id)
+        (ok dispute-id)
+    )
+)
+
+(define-public (vote-on-dispute
+        (dispute-id uint)
+        (vote-for bool)
+    )
+    (let (
+            (dispute-info (unwrap! (map-get? verification-disputes dispute-id)
+                err-dispute-not-found
+            ))
+            (existing-vote (map-get? dispute-votes {
+                dispute-id: dispute-id,
+                voter: tx-sender,
+            }))
+            (voter-position (unwrap! (map-get? staker-positions tx-sender) err-no-stake-found))
+            (voting-power (get total-staked voter-position))
+        )
+        (asserts! (is-eq (get status dispute-info) "active")
+            err-invalid-dispute-status
+        )
+        (asserts! (is-none existing-vote) err-already-voted)
+        (asserts!
+            (<= (+ (get challenge-block dispute-info) (var-get dispute-period))
+                stacks-block-height
+            )
+            err-dispute-period-ended
+        )
+        (asserts! (> voting-power u0) err-insufficient-stake)
+
+        (map-set dispute-votes {
+            dispute-id: dispute-id,
+            voter: tx-sender,
+        } {
+            vote: vote-for,
+            voting-power: voting-power,
+            vote-block: stacks-block-height,
+        })
+
+        (map-set verification-disputes dispute-id
+            (merge dispute-info {
+                votes-for: (if vote-for
+                    (+ (get votes-for dispute-info) voting-power)
+                    (get votes-for dispute-info)
+                ),
+                votes-against: (if vote-for
+                    (get votes-against dispute-info)
+                    (+ (get votes-against dispute-info) voting-power)
+                ),
+                total-voters: (+ (get total-voters dispute-info) u1),
+            })
+        )
+
+        (ok true)
+    )
+)
+
+(define-public (resolve-dispute (dispute-id uint))
+    (let (
+            (dispute-info (unwrap! (map-get? verification-disputes dispute-id)
+                err-dispute-not-found
+            ))
+            (token-id (get token-id dispute-info))
+            (dispute-end-block (+ (get challenge-block dispute-info) (var-get dispute-period)))
+            (votes-for (get votes-for dispute-info))
+            (votes-against (get votes-against dispute-info))
+            (challenge-successful (> votes-for votes-against))
+            (challenger (get challenger dispute-info))
+            (challenge-stake (get challenge-stake dispute-info))
+            (token-disputes-info (unwrap! (map-get? token-disputes token-id) err-dispute-not-found))
+        )
+        (asserts! (is-eq (get status dispute-info) "active")
+            err-invalid-dispute-status
+        )
+        (asserts! (>= stacks-block-height dispute-end-block)
+            err-dispute-period-ended
+        )
+
+        (if challenge-successful
+            (begin
+                (let ((contract-addr (get contract-address
+                        (unwrap-panic (map-get? token-metadata token-id))
+                    )))
+                    (map-set contract-verifications contract-addr {
+                        token-id: token-id,
+                        is-active: false,
+                        verification-count: (get verification-count
+                            (unwrap-panic (map-get? contract-verifications contract-addr))
+                        ),
+                    })
+                )
+                (unwrap!
+                    (as-contract (stx-transfer? challenge-stake tx-sender challenger))
+                    err-transfer-failed
+                )
+            )
+            (unwrap!
+                (as-contract (stx-transfer? challenge-stake tx-sender (as-contract tx-sender)))
+                err-transfer-failed
+            )
+        )
+
+        (map-set verification-disputes dispute-id
+            (merge dispute-info {
+                status: (if challenge-successful
+                    "upheld"
+                    "rejected"
+                ),
+                resolution-block: (some stacks-block-height),
+            })
+        )
+
+        (map-set token-disputes token-id
+            (merge token-disputes-info { active-dispute-id: none })
+        )
+
+        (ok challenge-successful)
     )
 )
 
@@ -244,6 +459,43 @@
             total-entries: u0,
         })
     )
+)
+
+(define-read-only (get-dispute-info (dispute-id uint))
+    (match (map-get? verification-disputes dispute-id)
+        dispute (ok dispute)
+        (err err-dispute-not-found)
+    )
+)
+
+(define-read-only (get-token-dispute-status (token-id uint))
+    (match (map-get? token-disputes token-id)
+        disputes (ok disputes)
+        (ok {
+            active-dispute-id: none,
+            dispute-count: u0,
+        })
+    )
+)
+
+(define-read-only (get-dispute-vote
+        (dispute-id uint)
+        (voter principal)
+    )
+    (match (map-get? dispute-votes {
+        dispute-id: dispute-id,
+        voter: voter,
+    })
+        vote (ok (some vote))
+        (ok none)
+    )
+)
+
+(define-read-only (get-dispute-params)
+    (ok {
+        dispute-period: (var-get dispute-period),
+        min-challenge-stake: (var-get min-challenge-stake),
+    })
 )
 
 (define-public (transfer
