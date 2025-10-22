@@ -17,6 +17,9 @@
 (define-constant err-insufficient-challenge-stake (err u115))
 (define-constant err-already-voted (err u116))
 (define-constant err-invalid-dispute-status (err u117))
+(define-constant err-invalid-renewal-config (err u118))
+(define-constant err-renewal-not-found (err u119))
+(define-constant err-insufficient-renewal-balance (err u120))
 
 (define-non-fungible-token verification-certificate uint)
 
@@ -28,6 +31,8 @@
 (define-data-var dispute-period uint u1008)
 (define-data-var min-challenge-stake uint u5000000)
 (define-data-var dispute-id-counter uint u0)
+(define-data-var auto-renewal-buffer-blocks uint u144)
+(define-data-var renewal-fee-multiplier uint u110)
 
 (define-map token-metadata
     uint
@@ -145,6 +150,27 @@
     {
         active-dispute-id: (optional uint),
         dispute-count: uint,
+    }
+)
+
+(define-map auto-renewal-configs
+    uint
+    {
+        is-enabled: bool,
+        renewal-duration: uint,
+        prepaid-balance: uint,
+        max-renewals: uint,
+        renewals-used: uint,
+        buffer-blocks: uint,
+        last-renewal-block: uint,
+    }
+)
+
+(define-map contract-auto-renewals
+    principal
+    {
+        token-id: uint,
+        is-active: bool,
     }
 )
 
@@ -498,6 +524,69 @@
     })
 )
 
+(define-read-only (get-auto-renewal-config (token-id uint))
+    (match (map-get? auto-renewal-configs token-id)
+        config (ok config)
+        (err err-renewal-not-found)
+    )
+)
+
+(define-read-only (get-contract-auto-renewal-status (contract-address principal))
+    (match (map-get? contract-auto-renewals contract-address)
+        renewal (ok renewal)
+        (ok {
+            token-id: u0,
+            is-active: false,
+        })
+    )
+)
+
+(define-read-only (check-renewal-eligibility (token-id uint))
+    (match (map-get? token-metadata token-id)
+        token-meta (match (map-get? auto-renewal-configs token-id)
+            renewal-config (let (
+                    (blocks-until-expiry (- (get expiry-block token-meta) stacks-block-height))
+                    (buffer-blocks (get buffer-blocks renewal-config))
+                    (level-info (unwrap-panic (map-get? verification-levels
+                        (get verification-level token-meta)
+                    )))
+                    (renewal-fee (/
+                        (* (get base-fee level-info)
+                            (var-get renewal-fee-multiplier)
+                        )
+                        u100
+                    ))
+                )
+                (ok {
+                    is-eligible: (and
+                        (get is-enabled renewal-config)
+                        (<= blocks-until-expiry buffer-blocks)
+                        (>= (get prepaid-balance renewal-config) renewal-fee)
+                        (< (get renewals-used renewal-config)
+                            (get max-renewals renewal-config)
+                        )
+                    ),
+                    blocks-until-expiry: blocks-until-expiry,
+                    renewal-fee: renewal-fee,
+                    prepaid-balance: (get prepaid-balance renewal-config),
+                    renewals-remaining: (- (get max-renewals renewal-config)
+                        (get renewals-used renewal-config)
+                    ),
+                })
+            )
+            (err err-renewal-not-found)
+        )
+        (err err-not-found)
+    )
+)
+
+(define-read-only (get-renewal-params)
+    (ok {
+        buffer-blocks: (var-get auto-renewal-buffer-blocks),
+        fee-multiplier: (var-get renewal-fee-multiplier),
+    })
+)
+
 (define-public (transfer
         (token-id uint)
         (sender principal)
@@ -722,6 +811,196 @@
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
         (var-set min-stake-amount new-amount)
+        (ok true)
+    )
+)
+
+(define-public (setup-auto-renewal
+        (token-id uint)
+        (renewal-duration uint)
+        (max-renewals uint)
+        (prepaid-amount uint)
+    )
+    (let (
+            (token-meta (unwrap! (map-get? token-metadata token-id) err-not-found))
+            (token-owner (unwrap! (nft-get-owner? verification-certificate token-id)
+                err-not-found
+            ))
+            (level-info (unwrap!
+                (map-get? verification-levels (get verification-level token-meta))
+                err-invalid-verification-level
+            ))
+            (renewal-fee (/ (* (get base-fee level-info) (var-get renewal-fee-multiplier))
+                u100
+            ))
+            (min-prepaid (/ (* renewal-fee max-renewals) u1))
+        )
+        (asserts! (is-eq tx-sender token-owner) err-not-token-owner)
+        (asserts! (>= renewal-duration (get min-duration level-info))
+            err-invalid-renewal-config
+        )
+        (asserts! (> max-renewals u0) err-invalid-renewal-config)
+        (asserts! (>= prepaid-amount min-prepaid) err-insufficient-payment)
+
+        (unwrap! (stx-transfer? prepaid-amount tx-sender (as-contract tx-sender))
+            err-transfer-failed
+        )
+
+        (map-set auto-renewal-configs token-id {
+            is-enabled: true,
+            renewal-duration: renewal-duration,
+            prepaid-balance: prepaid-amount,
+            max-renewals: max-renewals,
+            renewals-used: u0,
+            buffer-blocks: (var-get auto-renewal-buffer-blocks),
+            last-renewal-block: u0,
+        })
+
+        (map-set contract-auto-renewals (get contract-address token-meta) {
+            token-id: token-id,
+            is-active: true,
+        })
+
+        (ok true)
+    )
+)
+
+(define-public (add-renewal-funds
+        (token-id uint)
+        (additional-amount uint)
+    )
+    (let (
+            (token-owner (unwrap! (nft-get-owner? verification-certificate token-id)
+                err-not-found
+            ))
+            (renewal-config (unwrap! (map-get? auto-renewal-configs token-id)
+                err-renewal-not-found
+            ))
+        )
+        (asserts! (is-eq tx-sender token-owner) err-not-token-owner)
+        (asserts! (> additional-amount u0) err-insufficient-payment)
+
+        (unwrap!
+            (stx-transfer? additional-amount tx-sender (as-contract tx-sender))
+            err-transfer-failed
+        )
+
+        (map-set auto-renewal-configs token-id
+            (merge renewal-config { prepaid-balance: (+ (get prepaid-balance renewal-config) additional-amount) })
+        )
+
+        (ok (+ (get prepaid-balance renewal-config) additional-amount))
+    )
+)
+
+(define-public (execute-auto-renewal (token-id uint))
+    (let (
+            (token-meta (unwrap! (map-get? token-metadata token-id) err-not-found))
+            (renewal-config (unwrap! (map-get? auto-renewal-configs token-id)
+                err-renewal-not-found
+            ))
+            (level-info (unwrap!
+                (map-get? verification-levels (get verification-level token-meta))
+                err-invalid-verification-level
+            ))
+            (renewal-fee (/ (* (get base-fee level-info) (var-get renewal-fee-multiplier))
+                u100
+            ))
+            (blocks-until-expiry (- (get expiry-block token-meta) stacks-block-height))
+        )
+        (asserts! (get is-enabled renewal-config) err-invalid-renewal-config)
+        (asserts! (<= blocks-until-expiry (get buffer-blocks renewal-config))
+            err-invalid-renewal-config
+        )
+        (asserts! (>= (get prepaid-balance renewal-config) renewal-fee)
+            err-insufficient-renewal-balance
+        )
+        (asserts!
+            (< (get renewals-used renewal-config)
+                (get max-renewals renewal-config)
+            )
+            err-invalid-renewal-config
+        )
+
+        (map-set token-metadata token-id
+            (merge token-meta { expiry-block: (+ (get expiry-block token-meta)
+                (get renewal-duration renewal-config)
+            ) }
+            ))
+
+        (map-set auto-renewal-configs token-id
+            (merge renewal-config {
+                prepaid-balance: (- (get prepaid-balance renewal-config) renewal-fee),
+                renewals-used: (+ (get renewals-used renewal-config) u1),
+                last-renewal-block: stacks-block-height,
+            })
+        )
+
+        (ok {
+            new-expiry: (+ (get expiry-block token-meta)
+                (get renewal-duration renewal-config)
+            ),
+            fee-charged: renewal-fee,
+            remaining-balance: (- (get prepaid-balance renewal-config) renewal-fee),
+            renewals-remaining: (- (get max-renewals renewal-config)
+                (+ (get renewals-used renewal-config) u1)
+            ),
+        })
+    )
+)
+
+(define-public (disable-auto-renewal (token-id uint))
+    (let (
+            (token-owner (unwrap! (nft-get-owner? verification-certificate token-id)
+                err-not-found
+            ))
+            (renewal-config (unwrap! (map-get? auto-renewal-configs token-id)
+                err-renewal-not-found
+            ))
+            (token-meta (unwrap! (map-get? token-metadata token-id) err-not-found))
+            (refund-amount (get prepaid-balance renewal-config))
+        )
+        (asserts! (is-eq tx-sender token-owner) err-not-token-owner)
+
+        (map-set auto-renewal-configs token-id
+            (merge renewal-config {
+                is-enabled: false,
+                prepaid-balance: u0,
+            })
+        )
+
+        (map-set contract-auto-renewals (get contract-address token-meta) {
+            token-id: token-id,
+            is-active: false,
+        })
+
+        (if (> refund-amount u0)
+            (unwrap!
+                (as-contract (stx-transfer? refund-amount tx-sender token-owner))
+                err-transfer-failed
+            )
+            true
+        )
+
+        (ok refund-amount)
+    )
+)
+
+(define-public (update-renewal-buffer (new-buffer uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (>= new-buffer u144) err-invalid-renewal-config)
+        (var-set auto-renewal-buffer-blocks new-buffer)
+        (ok true)
+    )
+)
+
+(define-public (update-renewal-fee-multiplier (new-multiplier uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (>= new-multiplier u100) err-invalid-renewal-config)
+        (asserts! (<= new-multiplier u200) err-invalid-renewal-config)
+        (var-set renewal-fee-multiplier new-multiplier)
         (ok true)
     )
 )
