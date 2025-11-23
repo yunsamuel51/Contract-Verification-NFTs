@@ -470,6 +470,48 @@
     )
 )
 
+(define-private (build-verification-status (contract-address principal))
+    (match (map-get? contract-verifications contract-address)
+        verification (match (map-get? token-metadata (get token-id verification))
+            metadata
+            {
+                is-verified: (and
+                    (get is-active verification)
+                    (> (get expiry-block metadata) stacks-block-height)
+                ),
+                verification-level: (get verification-level metadata),
+                verified-by: (get verified-by metadata),
+                verification-date: (get verification-date metadata),
+                expiry-block: (get expiry-block metadata),
+                verification-count: (get verification-count verification),
+                contract-address: contract-address,
+            }
+            {
+                is-verified: false,
+                verification-level: "none",
+                verified-by: contract-owner,
+                verification-date: u0,
+                expiry-block: u0,
+                verification-count: u0,
+                contract-address: contract-address,
+            }
+        )
+        {
+            is-verified: false,
+            verification-level: "none",
+            verified-by: contract-owner,
+            verification-date: u0,
+            expiry-block: u0,
+            verification-count: u0,
+            contract-address: contract-address,
+        }
+    )
+)
+
+(define-read-only (get-batch-verification-status (contracts (list 50 principal)))
+    (ok (map build-verification-status contracts))
+)
+
 (define-read-only (get-verification-history-entry (entry-id uint))
     (match (map-get? verification-history entry-id)
         entry (ok entry)
